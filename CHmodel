@@ -1,0 +1,135 @@
+library(baseballr)
+library(ggplot2)
+library(dplyr)
+
+options(timeout = 300)
+pull_savant_week <- function(start_date, end_date) {
+  
+  url <- paste0(
+    "https://baseballsavant.mlb.com/statcast_search/csv?",
+    "all=true",
+    "&game_date_gt=", start_date,
+    "&game_date_lt=", end_date,
+    "&type=details"
+  )
+  
+  read.csv(url)
+}
+
+start_dates <- seq(
+  as.Date("2026-05-30"),
+  as.Date("2026-06-17"),
+  by = "7 days"
+)
+
+end_dates <- start_dates + 6
+
+
+data_list <- Map(pull_savant_week, start_dates, end_dates)
+data <- bind_rows(data_list)
+
+
+ff_data <- data %>%
+  filter(pitch_type == "FF")
+
+
+ff_data <- ff_data %>%
+  mutate(
+    whiff = ifelse(description %in% c("swinging_strike", 
+                                      "swinging_strike_blocked",
+                                      "foul_tip"), 1, 0)
+  )
+
+
+ff_data <- ff_data %>%
+  mutate(
+    yf = 17/12,
+    
+    t_plate = (
+      -vy0 -
+        sqrt(vy0^2 - 2 * ay * (release_pos_y - yf))
+    ) / ay,
+    
+    vz_plate = vz0 + az * t_plate,
+    vy_plate = vy0 + ay * t_plate,
+    
+    VAA = atan(vz_plate / abs(vy_plate)) * 180 / pi
+  )
+
+
+
+
+pitcher_lookup <- mlb_people(
+  person_ids = unique(model_data$pitcher)
+) %>%
+  select(id, full_name) %>%
+  rename(
+    pitcher = id,
+    pitcher_name = full_name
+  )
+
+
+
+model_data <- ff_data %>%
+  select(
+    pitcher,
+    whiff,
+    release_speed,
+    pfx_x,
+    pfx_z,
+    release_extension,
+    release_pos_x,
+    release_pos_z,
+    plate_x,
+    plate_z,
+    VAA
+  ) %>%
+  na.omit()
+
+model_data_named <- model_data %>%
+  left_join(pitcher_lookup, by = "pitcher")
+
+
+
+ch_model <- glm(
+  whiff ~ release_speed + pfx_x + pfx_z +
+    release_extension + release_pos_x + release_pos_z + VAA,
+  data = model_data_named,
+  family = "binomial"
+)
+
+summary(ch_model)
+
+model_data_named$predicted_whiff <- predict(ch_model, type = "response")
+
+league_avg <- mean(model_data_named$predicted_whiff)
+
+model_data_named$CH_plus <- 100 * model_data_named$predicted_whiff / league_avg
+
+summary(model_data_named$CH_plus)
+
+pitcher_CH <- model_data_named %>%
+  group_by(pitcher_name) %>%
+  summarise(
+    CH_plus = mean(CH_plus, na.rm = TRUE),
+    pitches = n()
+  ) %>%
+  filter(pitches >= 50) %>%
+  arrange(desc(CH_plus))
+
+head(pitcher_CH, 25)
+
+top10 <- pitcher_CH %>%
+  slice_max(CH_plus, n = 10)
+
+ggplot(top10,
+       aes(x = reorder(pitcher_name, CH_plus),
+           y = CH_plus)) +
+  geom_col() +
+  coord_flip() +
+  geom_hline(yintercept = 100, linetype = "dashed")+
+  labs(
+    title = "CH+ FF Leaders, (06/01-06/17)",
+    x = "Pitcher",
+    y = "CH+"
+  )
